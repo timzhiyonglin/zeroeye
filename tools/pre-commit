@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Run the diagnostic build before commits and stage the newest artifacts."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DIAGNOSTIC_DIR = ROOT / "diagnostic"
+CACHE_PATH = ROOT / ".git" / "zeroeye-pre-commit-cache.json"
+COUNTDOWN_SECONDS = 10
+
+
+def run_git(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=check,
+    )
+
+
+def tracked_files() -> list[Path]:
+    result = run_git(["ls-files"], check=True)
+    files: list[Path] = []
+    for line in result.stdout.splitlines():
+        path = ROOT / line
+        if not path.is_file():
+            continue
+        if line.startswith("diagnostic/build-"):
+            continue
+        files.append(path)
+    return files
+
+
+def source_fingerprint() -> str:
+    digest = hashlib.sha256()
+    for path in sorted(tracked_files()):
+        relative = path.relative_to(ROOT).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def latest_artifacts() -> list[Path]:
+    artifacts = sorted(
+        DIAGNOSTIC_DIR.glob("build-*.logd"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    latest_json = sorted(
+        DIAGNOSTIC_DIR.glob("build-*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if latest_json:
+        artifacts.append(latest_json[0])
+    return artifacts
+
+
+def load_cache() -> dict[str, object]:
+    if not CACHE_PATH.exists():
+        return {}
+    try:
+        return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_cache(fingerprint: str, artifacts: list[Path]) -> None:
+    CACHE_PATH.write_text(
+        json.dumps(
+            {
+                "source_fingerprint": fingerprint,
+                "artifacts": {
+                    path.relative_to(ROOT).as_posix(): file_hash(path)
+                    for path in artifacts
+                    if path.exists()
+                },
+                "updated_at": int(time.time()),
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def cache_matches(fingerprint: str, artifacts: list[Path]) -> bool:
+    cache = load_cache()
+    if cache.get("source_fingerprint") != fingerprint:
+        return False
+    cached_artifacts = cache.get("artifacts")
+    if not isinstance(cached_artifacts, dict) or not cached_artifacts:
+        return False
+    for path in artifacts:
+        relative = path.relative_to(ROOT).as_posix()
+        if cached_artifacts.get(relative) != file_hash(path):
+            return False
+    return True
+
+
+def countdown(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        for remaining in range(COUNTDOWN_SECONDS, 0, -1):
+            if stop_event.wait(1):
+                return
+            print(
+                f"zeroeye diagnostic build is running; next status in {remaining}s...",
+                flush=True,
+            )
+
+
+def run_build() -> int:
+    print("Running python3 build.py before commit...", flush=True)
+    stop_event = threading.Event()
+    timer = threading.Thread(target=countdown, args=(stop_event,), daemon=True)
+    timer.start()
+    try:
+        python = shutil.which("python3") or sys.executable
+        process = subprocess.run([python, "build.py"], cwd=ROOT)
+        return process.returncode
+    finally:
+        stop_event.set()
+        timer.join(timeout=1)
+
+
+def stage_artifacts(artifacts: list[Path]) -> None:
+    if not artifacts:
+        raise RuntimeError("No diagnostic/build-*.logd artifact was found.")
+    relative_paths = [path.relative_to(ROOT).as_posix() for path in artifacts]
+    run_git(["add", *relative_paths], check=True)
+    print("Staged diagnostic artifacts:")
+    for relative_path in relative_paths:
+        print(f"  - {relative_path}")
+
+
+def main() -> int:
+    try:
+        fingerprint = source_fingerprint()
+        artifacts = latest_artifacts()
+        if artifacts and cache_matches(fingerprint, artifacts):
+            print("Diagnostic inputs are unchanged; skipping rebuild.")
+            stage_artifacts(artifacts)
+            return 0
+
+        build_status = run_build()
+        artifacts = latest_artifacts()
+        if build_status != 0:
+            print(
+                "python3 build.py failed; aborting commit after preserving diagnostics.",
+                file=sys.stderr,
+            )
+            if artifacts:
+                stage_artifacts(artifacts)
+                save_cache(fingerprint, artifacts)
+            return build_status
+
+        stage_artifacts(artifacts)
+        save_cache(fingerprint, artifacts)
+        return 0
+    except Exception as exc:
+        print(f"pre-commit hook failed: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
